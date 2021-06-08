@@ -23,10 +23,10 @@ from jax import lax
 from jax import core
 from jax import numpy as jnp
 from jax._src import dtypes
+from jax._src import prng
 from jax.core import NamedShape
 from jax._src.api import jit, vmap
 from jax._src.numpy.lax_numpy import _constant_like, _convert_and_clip_integer, _check_arraylike
-from jax._src.prng import PRNGKey, fold_in, _random_bits, split, UINT_DTYPES
 from jax.lib import xla_bridge
 from jax.numpy.linalg import cholesky, svd, eigh
 from jax.interpreters import ad
@@ -42,6 +42,71 @@ IntegerArray = Array
 # https://github.com/numpy/numpy/blob/main/numpy/typing/_dtype_like.py.
 DTypeLikeInt = Any
 DTypeLikeFloat = Any
+
+UINT_DTYPES = prng.UINT_DTYPES
+
+
+### utilities
+
+
+# TODO(mattjj,jakevdp): add more info to error message, use this utility more
+def _asarray(x):
+  """A more restrictive jnp.asarray, only accepts JAX arrays and np.ndarrays."""
+  if not isinstance(x, (np.ndarray, jnp.ndarray)):
+    raise TypeError(f"Function requires array input, got {x} of type {type(x)}.")
+  return jnp.asarray(x)
+
+
+def _random_bits(key: prng.PRNGKey, bit_width, shape) -> jnp.ndarray:
+  return key.random_bits(bit_width, shape)
+
+
+### key operations
+
+
+def PRNGKey(seed: int) -> prng.PRNGKey:
+  """Create a pseudo-random number generator (PRNG) key given an integer seed.
+
+  Args:
+    seed: a 64- or 32-bit integer used as the value of the key.
+
+  Returns:
+    A PRNG key, which is modeled as an array of shape (2,) and dtype uint32. The
+    key is constructed from a 64-bit seed by effectively bit-casting to a pair
+    of uint32 values (or from a 32-bit seed by first padding out with zeros).
+  """
+  # TODO: update doc
+  return prng.make_prng_key(seed)
+
+
+def fold_in(key: prng.PRNGKey, data: int) -> prng.PRNGKey:
+  """Folds in data to a PRNG key to form a new PRNG key.
+
+  Args:
+    key: a PRNGKey (an array with shape (2,) and dtype uint32).
+    data: a 32bit integer representing data to be folded in to the key.
+
+  Returns:
+    A new PRNGKey that is a deterministic function of the inputs and is
+    statistically safe for producing a stream of new pseudo-random values.
+  """
+  # TODO: update doc
+  return key.fold_in(jnp.uint32(data))
+
+
+def split(key: prng.PRNGKey, num: int = 2) -> prng.PRNGKey:
+  """Splits a PRNG key into `num` new keys by adding a leading axis.
+
+  Args:
+    key: a PRNGKey (an array with shape (2,) and dtype uint32).
+    num: optional, a positive integer indicating the number of keys to produce
+      (default 2).
+
+  Returns:
+    An array with shape (num, 2) and dtype uint32 representing `num` new keys.
+  """
+  # TODO: update doc
+  return key.split(num)
 
 
 ### random samplers
@@ -59,7 +124,7 @@ def _check_shape(name, shape: Union[Sequence[int], NamedShape], *param_shapes):
       raise ValueError(msg.format(name, shape_, shape))
 
 
-def uniform(key: jnp.ndarray,
+def uniform(key: prng.PRNGKey,
             shape: Union[Sequence[int], NamedShape] = (),
             dtype: DTypeLikeFloat = dtypes.float_,
             minval: RealArray = 0.,
@@ -117,7 +182,7 @@ def _uniform(key, shape, dtype, minval, maxval) -> jnp.ndarray:
       lax.reshape(floats * (maxval - minval) + minval, shape.positional))
 
 
-def randint(key: jnp.ndarray,
+def randint(key: prng.PRNGKey,
             shape: Sequence[int],
             minval: IntegerArray,
             maxval: IntegerArray,
@@ -204,7 +269,7 @@ def _randint(key, shape, minval, maxval, dtype):
   return lax.add(minval, lax.convert_element_type(random_offset, dtype))
 
 
-def shuffle(key: jnp.ndarray, x: Array, axis: int = 0) -> jnp.ndarray:
+def shuffle(key: prng.PRNGKey, x: Array, axis: int = 0) -> jnp.ndarray:
   """Shuffle the elements of an array uniformly at random along an axis.
 
   Args:
@@ -221,7 +286,7 @@ def shuffle(key: jnp.ndarray, x: Array, axis: int = 0) -> jnp.ndarray:
   return _shuffle(key, x, axis)  # type: ignore
 
 
-def permutation(key: jnp.ndarray, x: Array) -> jnp.ndarray:
+def permutation(key: prng.PRNGKey, x: Array) -> jnp.ndarray:
   """
   Permute elements of an array along its first axis or return a permuted range.
 
@@ -277,7 +342,7 @@ def _shuffle(key, x, axis) -> jnp.ndarray:
   return x
 
 
-def choice(key: jnp.ndarray,
+def choice(key: prng.PRNGKey,
            a: IntegerArray,
            shape: Sequence[int] = (),
            replace: bool = True,
@@ -342,7 +407,7 @@ def choice(key: jnp.ndarray,
   return result.reshape(shape)
 
 
-def normal(key: jnp.ndarray,
+def normal(key: prng.PRNGKey,
            shape: Union[Sequence[int], NamedShape] = (),
            dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample standard normal random values with given shape and float dtype.
@@ -386,7 +451,7 @@ def _normal_real(key, shape, dtype) -> jnp.ndarray:
   return np.array(np.sqrt(2), dtype) * lax.erf_inv(u)
 
 
-def multivariate_normal(key: jnp.ndarray,
+def multivariate_normal(key: prng.PRNGKey,
                         mean: RealArray,
                         cov: RealArray,
                         shape: Optional[Sequence[int]] = None,
@@ -454,7 +519,7 @@ def _multivariate_normal(key, mean, cov, shape, dtype, method) -> jnp.ndarray:
   return mean + jnp.einsum('...ij,...j->...i', factor, normal_samples)
 
 
-def truncated_normal(key: jnp.ndarray,
+def truncated_normal(key: prng.PRNGKey,
                      lower: RealArray,
                      upper: RealArray,
                      shape: Optional[Union[Sequence[int], NamedShape]] = None,
@@ -511,7 +576,7 @@ def _truncated_normal(key, lower, upper, shape, dtype) -> jnp.ndarray:
       lax.nextafter(lax.stop_gradient(upper), np.array(-np.inf, dtype=dtype)))
 
 
-def bernoulli(key: jnp.ndarray,
+def bernoulli(key: prng.PRNGKey,
               p: RealArray = np.float32(0.5),
               shape: Optional[Union[Sequence[int], NamedShape]] = None) -> jnp.ndarray:
   """Sample Bernoulli random values with given shape and mean.
@@ -548,7 +613,7 @@ def _bernoulli(key, p, shape) -> jnp.ndarray:
   return uniform(key, shape, lax.dtype(p)) < p
 
 
-def beta(key: jnp.ndarray,
+def beta(key: prng.PRNGKey,
          a: RealArray,
          b: RealArray,
          shape: Optional[Sequence[int]] = None,
@@ -595,7 +660,7 @@ def _beta(key, a, b, shape, dtype):
   return gamma_a / (gamma_a + gamma_b)
 
 
-def cauchy(key: jnp.ndarray,
+def cauchy(key: prng.PRNGKey,
            shape: Sequence[int] = (),
            dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample Cauchy random values with given shape and float dtype.
@@ -625,7 +690,7 @@ def _cauchy(key, shape, dtype):
   return lax.tan(lax.mul(pi, lax.sub(u, _constant_like(u, 0.5))))
 
 
-def dirichlet(key: jnp.ndarray,
+def dirichlet(key: prng.PRNGKey,
               alpha: RealArray,
               shape: Optional[Sequence[int]] = None,
               dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
@@ -672,7 +737,7 @@ def _dirichlet(key, alpha, shape, dtype):
   return gamma_samples / jnp.sum(gamma_samples, axis=-1, keepdims=True)
 
 
-def exponential(key: jnp.ndarray,
+def exponential(key: prng.PRNGKey,
                 shape: Sequence[int] = (),
                 dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample Exponential random values with given shape and float dtype.
@@ -771,9 +836,9 @@ def _gamma_impl(key, a, use_vmap=False):
   a_shape = jnp.shape(a)
   # split key to match the shape of a
   key_ndim = jnp.ndim(key) - 1
-  key = jnp.reshape(key, (-1, 2))
+  key = prng.PRNGKey(jnp.reshape(key, (-1, 2)))
   key = vmap(split, in_axes=(0, None))(key, prod(a_shape[key_ndim:]))
-  keys = jnp.reshape(key, (-1, 2))
+  keys = prng.PRNGKey(jnp.reshape(key.key, (-1, 2)))
   alphas = jnp.reshape(a, -1)
   if use_vmap:
     samples = vmap(_gamma_one)(keys, alphas)
@@ -802,7 +867,7 @@ xla.backend_specific_translations['cpu'][random_gamma_p] = xla.lower_fun(
     multiple_results=False)
 batching.primitive_batchers[random_gamma_p] = _gamma_batching_rule
 
-def gamma(key: jnp.ndarray,
+def gamma(key: prng.PRNGKey,
           a: RealArray,
           shape: Optional[Sequence[int]] = None,
           dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
@@ -822,13 +887,16 @@ def gamma(key: jnp.ndarray,
     A random array with the specified dtype and with shape given by ``shape`` if
     ``shape`` is not None, or else by ``a.shape``.
   """
+  if not isinstance(key, prng.PRNGKey):
+    raise NotImplementedError(
+        f'`gamma` only supported for the default PRNG, not f{type(key)}')
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `gamma` must be a float "
                      f"dtype, got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
   if shape is not None:
     shape = core.canonicalize_shape(shape)
-  return _gamma(key, a, shape, dtype)
+  return _gamma(key.key, a, shape, dtype)
 
 @partial(jit, static_argnums=(2, 3))
 def _gamma(key, a, shape, dtype):
@@ -930,7 +998,7 @@ def _poisson(key, lam, shape, dtype):
   return lax.select(lam == 0, jnp.zeros_like(result), result)
 
 
-def poisson(key: jnp.ndarray,
+def poisson(key: prng.PRNGKey,
             lam: RealArray,
             shape: Sequence[int] = (),
             dtype: DTypeLikeInt = dtypes.int_) -> jnp.ndarray:
@@ -955,7 +1023,7 @@ def poisson(key: jnp.ndarray,
   return _poisson(key, lam, shape, dtype)
 
 
-def gumbel(key: jnp.ndarray,
+def gumbel(key: prng.PRNGKey,
            shape: Sequence[int] = (),
            dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample Gumbel random values with given shape and float dtype.
@@ -984,7 +1052,7 @@ def _gumbel(key, shape, dtype):
       uniform(key, shape, dtype, minval=jnp.finfo(dtype).tiny, maxval=1.)))
 
 
-def categorical(key: jnp.ndarray,
+def categorical(key: prng.PRNGKey,
                 logits: RealArray,
                 axis: int = -1,
                 shape: Optional[Sequence[int]] = None) -> jnp.ndarray:
@@ -1018,7 +1086,7 @@ def categorical(key: jnp.ndarray,
   return jnp.argmax(gumbel(key, sample_shape + logits.shape, logits.dtype) + logits, axis=axis)
 
 
-def laplace(key: jnp.ndarray,
+def laplace(key: prng.PRNGKey,
             shape: Sequence[int] = (),
             dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample Laplace random values with given shape and float dtype.
@@ -1048,7 +1116,7 @@ def _laplace(key, shape, dtype):
   return lax.mul(lax.sign(u), lax.log1p(lax.neg(lax.abs(u))))
 
 
-def logistic(key: jnp.ndarray,
+def logistic(key: prng.PRNGKey,
              shape: Sequence[int] = (),
              dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample logistic random values with given shape and float dtype.
@@ -1077,7 +1145,7 @@ def _logistic(key, shape, dtype):
   return lax.log(lax.div(x, lax.sub(lax._const(x, 1), x)))
 
 
-def pareto(key: jnp.ndarray,
+def pareto(key: prng.PRNGKey,
            b: RealArray,
            shape: Optional[Sequence[int]] = None,
            dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
@@ -1117,7 +1185,7 @@ def _pareto(key, b, shape, dtype):
   return lax.exp(e / b)
 
 
-def t(key: jnp.ndarray,
+def t(key: prng.PRNGKey,
       df: RealArray,
       shape: Sequence[int] = (),
       dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
@@ -1160,7 +1228,7 @@ def _t(key, df, shape, dtype):
   return n * jnp.sqrt(half_df / g)
 
 
-def rademacher(key: jnp.ndarray,
+def rademacher(key: prng.PRNGKey,
                shape: Sequence[int],
                dtype: DTypeLikeInt = dtypes.int_) -> jnp.ndarray:
   """Sample from a Rademacher distribution.
@@ -1186,7 +1254,7 @@ def _rademacher(key, shape, dtype):
   return (2 * bernoulli_samples - 1).astype(dtype)
 
 
-def maxwell(key: jnp.ndarray,
+def maxwell(key: prng.PRNGKey,
             shape: Sequence[int] = (),
             dtype: DTypeLikeFloat = dtypes.float_) -> jnp.ndarray:
   """Sample from a one sided Maxwell distribution.
@@ -1219,7 +1287,7 @@ def _maxwell(key, shape, dtype):
   return jnp.linalg.norm(norm_rvs, axis=-1)
 
 
-def double_sided_maxwell(key: jnp.ndarray,
+def double_sided_maxwell(key: prng.PRNGKey,
                          loc: RealArray,
                          scale: RealArray,
                          shape: Sequence[int] = (),
@@ -1264,7 +1332,7 @@ def _double_sided_maxwell(key, loc, scale, shape, dtype):
   return random_sign * maxwell_rvs * scale + loc
 
 
-def weibull_min(key: jnp.ndarray,
+def weibull_min(key: prng.PRNGKey,
                 scale: RealArray,
                 concentration: RealArray,
                 shape: Sequence[int] = (),

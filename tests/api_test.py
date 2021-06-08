@@ -518,10 +518,11 @@ class CPPJitTest(jtu.BufferDonationTestCase):
       key_list[0] = key
       return jax.random.normal(subkey, ())
 
-    key_list[0] = np.array([2384771982, 3928867769], dtype=np.uint32)
+    key_list[0] = jax._src.prng.PRNGKey(
+        np.array([2384771982, 3928867769], dtype=np.uint32))
     init()
     self.jit(init)()
-    self.assertIsInstance(key_list[0], core.Tracer)
+    self.assertIsInstance(key_list[0].key, core.Tracer)
 
   def test_jit_wrapped_attributes(self):
     def f(x: int) -> int:

@@ -1048,7 +1048,8 @@ class PmapTest(jtu.JaxTestCase):
 
     @vmap
     def s(keys):
-      keys = jnp.broadcast_to(keys, (N_DEVICES,) + keys.shape)
+      keys = jax._src.prng.PRNGKey(
+          jnp.broadcast_to(keys.key, (N_DEVICES,) + keys.key.shape))
       return g(keys)
 
     ans = s(keys)  # doesn't crash
