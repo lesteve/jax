@@ -2894,6 +2894,9 @@ print(out)
 
 # ## Part 6: effects
 
+import ctypes
+
+
 print_p = Primitive("print")
 
 def xprint(*args):
@@ -2919,11 +2922,55 @@ jaxpr, _, _ = make_jaxpr(lambda x: xprint('hi: {}', x),
                          ShapedArray((3,), np.dtype('float32')))
 print(jaxpr)
 
-
 def xprint_translation(c, token, in_avals, in_vals, *, fmt):
-  import autodidax_ext  # TODO get this in jaxlib
-  callback = lambda *args: print(fmt.format(*args))
-  return autodidax_ext.emit_callback(c, token, callback, in_vals, [])
+  callback = PyCallback(lambda *args: print(fmt.format(*args)),
+                        [shape_dtype_spec(c, x) for x in in_vals])
+  leak(callback)  # leak for now, should attach to executable
+  callback_addr = xops.Constant(c, np.uint64(id(callback)))
+  token = xops.CustomCall(c, b"pycall",
+                          operands=[token, callback_addr, *in_vals],
+                          shape=xc.Shape.token_shape(), has_side_effect=True)
+  return token, []
 xla_translations[print_p] = xprint_translation
+leak = [].append
+
+def shape_dtype_spec(c: xe.XlaBuilder, x: xe.XlaOp):
+  s = c.get_shape(x)
+  shape, dtype = s.dimensions(), s.numpy_dtype()
+  return ShapeDType(dtype.itemsize * int(np.prod(shape)), dtype, shape)
+
+class ShapeDType(NamedTuple):
+  size: int
+  dtype: np.dtype
+  shape: Tuple[int, ...]
+
+class PyCallback(NamedTuple):
+  f: Callable
+  arg_shapes: List[ShapeDType]
+
+  def __call__(self, *args):
+    return self.f(*args)
+
+
+@ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+def pycall(result_ptr, arg_ptr_ptr):
+  f = ctypes.cast(arg_ptr_ptr[1][0], ctypes.py_object).value
+  args = [ptr_to_ndarr(arg_ptr_ptr[i+2], s) for i, s in enumerate(f.arg_shapes)]
+  f(*args)
+
+def ptr_to_ndarr(p: ctypes._Pointer, s: ShapeDType):
+  p = ctypes.cast(p, ctypes.POINTER(ctypes.c_uint8))
+  return np.ctypeslib.as_array(p, (s.size,)).view(s.dtype).reshape(s.shape)
+
+
+PyCapsule_Destructor = ctypes.CFUNCTYPE(None, ctypes.py_object)
+PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+PyCapsule_New.restype = ctypes.py_object
+PyCapsule_New.argtypes = (ctypes.c_void_p, ctypes.c_char_p, PyCapsule_Destructor)
+
+def make_custom_call_target(ctypes_callback):
+  func_ptr = ctypes.c_void_p.from_param(ctypes_callback)
+  return PyCapsule_New(func_ptr, b"xla._CUSTOM_CALL_TARGET", PyCapsule_Destructor(0))
+xc.register_custom_call_target(b"pycall", make_custom_call_target(pycall))
 
 jit(lambda x: xprint('hi: {}', x))(np.array([3., 1., 4.]))
