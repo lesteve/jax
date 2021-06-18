@@ -4,9 +4,10 @@
 from cpython.pycapsule cimport PyCapsule_New
 from libc.stdint cimport uint8_t
 cimport numpy as np
-import numpy as np
 np.import_array()
 
+from collections import namedtuple
+import numpy as np
 from jaxlib import xla_client
 _ops = xla_client.ops
 Shape = xla_client.Shape
@@ -23,34 +24,35 @@ cdef void caller(void *out, const void **data) nogil:
     args = tuple(
         np.asarray(<const np.uint8_t[:s.size]> data[i+2]).view(s.dtype).reshape(s.shape)
         for i, s in enumerate(f.arg_shapes))
-    f(*args)
+    outs = f(*args)
+    # TODO use outs
 register_cpu_custom_call_target(b"caller", <void*>(caller))
 
 
-class ShapeDType:
-  def __init__(self, size, dtype, shape):
-    self.size = size
-    self.dtype = dtype
-    self.shape = shape
+ShapeDType = namedtuple('ShapeDType', ['size', 'dtype', 'shape'])
 
 class PyCallback:
-  def __init__(self, f, arg_shapes):
+  def __init__(self, f, arg_shapes, out_shapes):
     self.f = f
     self.arg_shapes = arg_shapes
+    self.out_shapes = out_shapes
 
   def __call__(self, *args):
     return self.f(*args)
 
-def emit_callback(c, token, f, *args):
-  callback = PyCallback(f, [shape_dtype_spec(c, x) for x in args])
+def emit_callback(c, token, f, args, out_shapes):
+  callback = PyCallback(f, [shape_dtype_spec(c, x) for x in args], out_shapes)
   persist_for_life_of_executable(callback)
-  return _ops.CustomCallWithLayout(
-      c, b"caller", shape_with_layout=Shape.token_shape(),
-      operands=(token, _ops.Constant(c, np.uint64(id(callback))), *args),
+  out = _ops.CustomCallWithLayout(
+      c, b"caller",
       operand_shapes_with_layout=(
           Shape.token_shape(), Shape.array_shape(np.dtype(np.uint64), (), ()),
           *(c.get_shape(x) for x in args)),
+      shape_with_layout=Shape.tuple_shape((Shape.token_shape(), *out_shapes)),
+      operands=(token, _ops.Constant(c, np.uint64(id(callback))), *args),
       has_side_effect=True)
+  token, *outs = [_ops.GetTupleElement(out, i) for i in range(1 + len(out_shapes))]
+  return token, outs
 
 def shape_dtype_spec(c, x):
   s = c.get_shape(x)

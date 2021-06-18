@@ -2915,15 +2915,15 @@ def xprint_abstract_eval(*args: ShapedArray, fmt: str) -> Tuple[List[Any], bool]
   return [], True
 abstract_eval_rules[print_p] = xprint_abstract_eval
 
-jaxpr, _, _ = make_jaxpr(lambda: xprint('hi'))
+jaxpr, _, _ = make_jaxpr(lambda x: xprint('hi: {}', x),
+                         ShapedArray((3,), np.dtype('float32')))
 print(jaxpr)
 
 
 def xprint_translation(c, token, in_avals, in_vals, *, fmt):
-  import autodidax_ext
+  import autodidax_ext  # TODO get this in jaxlib
   callback = lambda *args: print(fmt.format(*args))
-  token = autodidax_ext.emit_callback(c, token, callback, *in_vals)
-  return token, []
+  return autodidax_ext.emit_callback(c, token, callback, in_vals, [])
 xla_translations[print_p] = xprint_translation
 
-jit(lambda x: xprint('hi: {}', x))(np.array([1., 2.]))
+jit(lambda x: xprint('hi: {}', x))(np.array([3., 1., 4.]))
