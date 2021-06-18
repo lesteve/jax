@@ -2214,13 +2214,58 @@ def _gather_dimensions_proto(indices_shape, dimension_numbers):
   return proto
 
 
-def _gather_without_xla(operand: TfVal,
-                        start_indices: TfVal, *,
-                        dimension_numbers, slice_sizes,
-                        _in_avals: Sequence[core.ShapedArray]):
-  # Attempt to use tf.gather for lax.gather_p.
+def _clip(max_indices: TfVal, start_indices: TfVal, slice_sizes):
+  """Simulates XLA clipping behavior with TF ops.
 
-  # Handle only the case when batch_dims=0.
+  Various TF ops have different clipping behavior than XLA:
+  * If `start_indices` is OOB, then TF fails but XLA clips the indices to
+    [0, max_len].
+  * If `start_indices + slice_size` is OOB, then TF fails, but XLA adjust
+    `start_indices` so that a full slice is returned.
+  This function clips the start indices correctly.
+  """
+  # If `max_indices` and `slice_sizes` are Python tuples of integers,
+  # `tf.subtract` returns a Tensor of dtype tf.int32, which may conflict with
+  # the dtype of `start_indices` if we run in x64 mode and throw an error when
+  # calling `tf.clip_by_vaue`. Therefore we cast to the right dtype here
+  # explicitly.
+  max_indices = tf.cast(max_indices, dtype=start_indices.dtype)
+  max_start = tf.subtract(max_indices, slice_sizes)
+  return tf.clip_by_value(start_indices, 0, max_start)
+
+
+def _gather_using_tf_slice(operand: TfVal, slice_updates: TfVal, *,
+                           dims, slice_sizes,
+                           _in_avals: Sequence[core.ShapedArray],
+                           _out_aval: core.ShapedArray):
+  """Implements 'scalar indexing into arrays' cases of lax.gather using tf.slice.
+
+  E.g., op[2], op[:, :5, :], jnp.take(op, 0, axis=0).
+  """
+  op_shape = _in_avals[0].shape
+  # tf.scatter_nd expects one more dimension for indices and shape.
+  indices = tf.expand_dims(dims.start_index_map, 1)
+  begin = tf.scatter_nd(indices, slice_updates, [len(op_shape)])
+  begin = _clip(op_shape, begin, slice_sizes)
+  end = slice_sizes + begin
+
+  # Convert from tuple of dimensions to shrink mask. e.g. (0, 2) --> 5.
+  shrink_mask = sum(2 ** x for x in dims.collapsed_slice_dims)
+  res = tf.strided_slice(operand, begin, end, shrink_axis_mask=shrink_mask)
+  # Shape inference doesn't work for tf.strided_slice.
+  res.set_shape(_aval_to_tf_shape(_out_aval))
+  return res
+
+
+def _gather_using_tf_gather(operand: TfVal, start_indices: TfVal, *,
+                            dims, slice_sizes,
+                            _in_avals: Sequence[core.ShapedArray],
+                            _out_aval: core.ShapedArray):
+  """Implements 'multi-dimensional indexing into arrays' cases of lax.gather using tf.gather.
+
+  E.g., jnp.take(op, [[0], [1]], axis=0).
+  """
+  # Handle only the case when tf.gather argument batch_dims=0.
   # Find axis to match the tf.gather semantics
   # Let I = len(start_indices_shape)
   # let O = len(op_shape)
@@ -2228,45 +2273,58 @@ def _gather_without_xla(operand: TfVal,
   # collapsed_slice_dims == (axis,)
   # start_index_map == (axis,)
   # offset_dims == (0, 1, ..., axis - 1, axis + I, ..., O + I - 1)
+  # We added a trailing dimension of size 1
   op_shape = _in_avals[0].shape
   start_indices_shape = _in_avals[1].shape
-  assert len(op_shape) == len(slice_sizes)
-  if not (len(op_shape) >= 1 and
-          len(dimension_numbers.start_index_map) == 1 and
-          len(dimension_numbers.collapsed_slice_dims) == 1 and
-          dimension_numbers.collapsed_slice_dims[0] == dimension_numbers.start_index_map[0] and
-          len(dimension_numbers.offset_dims) == len(op_shape) - 1):
-    raise _xla_disabled_error(
-        "gather",
-        f"unsupported dimension_numbers '{dimension_numbers}'; op_shape={op_shape}.")
-  # We added a trailing dimension of size 1
+
   if not core.symbolic_equal_dim(start_indices_shape[-1], 1):
     raise _xla_disabled_error("gather",
                               "trailing dimension for start_indices must be 1")
   # Guess the axis
-  axis = dimension_numbers.collapsed_slice_dims[0]
+  axis = dims.collapsed_slice_dims[0]
   index_dims = len(start_indices_shape) - 1
   expected_offset_dims = tuple(
       list(range(axis)) +
       list(range(axis + index_dims, len(op_shape) + index_dims - 1)))
-  if dimension_numbers.offset_dims != expected_offset_dims:
+  if dims.offset_dims != expected_offset_dims:
     raise _xla_disabled_error(
         "gather",
-        f"unexpected dimension_numbers.offset_dims {dimension_numbers.offset_dims} != {expected_offset_dims}")
+        f"unexpected dimension_numbers.offset_dims {dims.offset_dims} != {expected_offset_dims}")
   expected_slice_sizes = op_shape[:axis] + (1,) + op_shape[axis + 1:]
   if not core.symbolic_equal_shape(slice_sizes, expected_slice_sizes):
     raise _xla_disabled_error(
         "gather",
         f"unexpected slice_sizes {slice_sizes} != {expected_slice_sizes}")
 
-  start_indices_reshaped = tf.reshape(start_indices,
-                                      _eval_shape(start_indices_shape[0:-1]))
-  start_indices_clipped = tf.clip_by_value(
-      start_indices_reshaped,
-      tf.constant(0, dtype=start_indices_reshaped.dtype),
-      tf.subtract(tf.cast(_eval_shape(op_shape)[axis], start_indices_reshaped.dtype),
-                  tf.constant(1, dtype=start_indices_reshaped.dtype)))
-  return tf.gather(operand, start_indices_clipped, axis=axis, batch_dims=0)
+  start_indices = _clip(op_shape[axis], tf.squeeze(start_indices, -1), 1)
+  return tf.gather(operand, start_indices, axis=axis, batch_dims=0)
+
+
+def _gather_without_xla(operand: TfVal,
+                        start_indices: TfVal, *,
+                        dims: lax.GatherDimensionNumbers,
+                        slice_sizes,
+                        _in_avals: Sequence[core.ShapedArray],
+                        _out_aval: core.ShapedArray):
+  """Best-effort attempt at implementing lax.gather using TF ops."""
+  op_shape = _in_avals[0].shape
+  start_indices_shape = _in_avals[1].shape
+  assert len(op_shape) == len(slice_sizes)
+
+  if len(start_indices_shape) == 1:
+    return _gather_using_tf_slice(operand, start_indices, dims=dims,
+        slice_sizes=slice_sizes, _in_avals=_in_avals, _out_aval=_out_aval)
+
+  elif (len(op_shape) >= 1 and len(dims.start_index_map) == 1 and
+        len(dims.collapsed_slice_dims) == 1 and
+        dims.collapsed_slice_dims[0] == dims.start_index_map[0] and
+        len(dims.offset_dims) == len(op_shape) - 1):
+    return _gather_using_tf_gather(operand, start_indices, dims=dims,
+        slice_sizes=slice_sizes, _in_avals=_in_avals, _out_aval=_out_aval)
+
+  raise _xla_disabled_error(
+        "gather",
+        f"unsupported dimension_numbers '{dims}'; op_shape={op_shape}.")
 
 
 @partial(bool_to_int8, argnums=[0])
@@ -2285,8 +2343,9 @@ def _gather(operand, start_indices, *, dimension_numbers, slice_sizes,
     return out
 
   return _gather_without_xla(operand, start_indices,
-                             dimension_numbers=dimension_numbers,
-                             slice_sizes=slice_sizes, _in_avals=_in_avals)
+                             dims=dimension_numbers,
+                             slice_sizes=slice_sizes, _in_avals=_in_avals,
+                             _out_aval=_out_aval)
 
 
 tf_impl_with_avals[lax.gather_p] = _gather
@@ -2321,26 +2380,8 @@ def _dynamic_slice(operand, *start_indices, slice_sizes,
     res.set_shape(_aval_to_tf_shape(_out_aval))
     return res
 
-  # If XLA is disabled, we use `tf.slice` as a fallback, which has different out
-  # of bounds (OOB) behavior than `lax.dynamic_slice_p`:
-  # * If `slice size > max_len`, then both `tf.slice` and `lax.dynamic_slice_p`
-  #   fail, so we ignore this case.
-  # * If `start_indices` is OOB, then `tf.slice` fails but `lax.dynamic_slice_p`
-  #   clips the indices to [0, max_len].
-  # * If `start_indices + slice_size` is OOB, then `tf.slice` fails, but
-  #   `lax.dynamic_slice_p` adjust `start_indices` so that a full slice is
-  #   returned.
-  # The code below manually clips the start indices so that the behavior is
-  # the same as `lax.dynamic_slice_p`.
   operand_shape = _eval_shape(_in_avals[0].shape)
-  max_start = tf.subtract(operand_shape, slice_sizes)
-  # If `operand_shape` and `slice_sizes` are Python tuples of integers,
-  # `tf.subtract` returns a Tensor of dtype tf.int32, which may conflict with
-  # the dtype of `start_indices` if we run in x64 mode and throw an error when
-  # calling `tf.clip_by_vaue`. Therefore we cast to the right dtype here
-  # explicitly.
-  max_start = tf.cast(max_start, dtype=start_indices.dtype)
-  start_indices = tf.clip_by_value(start_indices, 0, max_start)
+  start_indices = _clip(operand_shape, start_indices, slice_sizes)
   return tf.slice(operand, start_indices, size=slice_sizes)
 
 
