@@ -2919,33 +2919,10 @@ jaxpr, _, _ = make_jaxpr(lambda: xprint('hi'))
 print(jaxpr)
 
 
-import autodidax_ext
-
-class ShapeDType(NamedTuple):
-  size: int
-  dtype: np.dtype
-  shape: Tuple[int, ...]
-
-class F(NamedTuple):
-  f: Callable
-  arg_shapes: List[ShapeDType]
-
-  def __call__(self, *args):
-    return self.f(*args)
-
-def emit_callback(c, token, f, *args):
-  f_ = F(f, [shape_dtype_spec(c, x) for x in args])
-  return autodidax_ext.pycallback(c, token, f_, *args)
-
-def shape_dtype_spec(c, x):
-  s = c.get_shape(x)
-  shape, dtype = s.dimensions(), s.numpy_dtype()
-  return ShapeDType(dtype.itemsize * int(np.prod(shape)), dtype, shape)
-
-
 def xprint_translation(c, token, in_avals, in_vals, *, fmt):
+  import autodidax_ext
   callback = lambda *args: print(fmt.format(*args))
-  token = emit_callback(c, token, callback, *in_vals)
+  token = autodidax_ext.emit_callback(c, token, callback, *in_vals)
   return token, []
 xla_translations[print_p] = xprint_translation
 
